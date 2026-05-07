@@ -941,7 +941,7 @@ async def alarm(
     preferences.setdefault(long_name, {})[alarm_type] = channel_id
 
     # save and confirm
-    client.upload_from_text(key, json.dumps(preferences))
+    write_json_file(key, preferences)
     await interaction.followup.send(f"{alarm_type} alarm for {squadron_name} set to channel {channel_id}.", ephemeral=True)
 
     logging.info(f"{guild_name} ({guild_id}) is now logging {squadron_name} in channel ID {channel_id}")
