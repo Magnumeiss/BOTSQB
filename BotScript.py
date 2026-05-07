@@ -998,7 +998,7 @@ async def quick_log(interaction: discord.Interaction, sq_name: str, type: str = 
     preferences.setdefault(long_name, {})[type] = str(channel_id)
 
     # save it back
-    client.upload_from_text(key, json.dumps(preferences))
+    write_json_file(key, preferences)
 
     await interaction.followup.send(
         f"{type} alarm for {sq_name} set to this channel.",
