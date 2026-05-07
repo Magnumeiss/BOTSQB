@@ -1108,16 +1108,7 @@ active_guessing_games = {}  # Dictionary to keep track of active guessing games 
 
 def update_leaderboard(guild_id, user_id, points):
     filename = f"{guild_id}-game-rank.json"
-    leaderboard = {}
-
-    # Download the leaderboard file
-    try:
-        leaderboard_json = client.download_as_text(filename)
-        leaderboard = json.loads(leaderboard_json)
-    except Exception:
-        logging.warning(
-            f"Leaderboard file for guild {guild_id} not found. Creating a new one."
-        )
+    leaderboard = read_json_file(filename, {})
 
     user_id_str = str(user_id)
 
@@ -1126,6 +1117,8 @@ def update_leaderboard(guild_id, user_id, points):
     else:
         leaderboard[user_id_str] = points
 
+    write_json_file(filename, leaderboard)
+    
     # Upload the updated leaderboard file
     client.upload_from_text(filename, json.dumps(leaderboard))
 
