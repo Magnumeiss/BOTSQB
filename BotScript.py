@@ -104,20 +104,20 @@ async def on_ready():
 async def on_guild_join(guild):
     logging.info(f'Joined new guild: {guild.name} (id: {guild.id})')
     await bot.tree.sync()
+
     guild_id = guild.id
-    key = "guilds.json"
+    filename = "guilds.json"
 
     try:
-        data = client.download_as_text(key)
-        guilds = json.loads(data)
-    except ObjectNotFoundError:
+        with open(filename, "r", encoding="utf-8") as f:
+            guilds = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         guilds = []
 
     if guild_id not in guilds:
         guilds.append(guild_id)
         with open(filename, "w", encoding="utf-8") as f:
-    f.write(squadrons_json) 
-
+            json.dump(guilds, f, indent=4)
 
 @tasks.loop(hours=2)
 async def replay_cleaning_task():
