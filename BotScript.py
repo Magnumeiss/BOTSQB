@@ -1427,7 +1427,15 @@ LANGUAGE_MAP = {
 
 
 DEEPL_API_KEY = os.environ.get("DEEPL_KEY")
-translator = GoogleTranslator(source='auto', target='de')
+def perform_translation(text: str, target_language: str) -> str:
+    try:
+        return GoogleTranslator(
+            source="auto",
+            target=target_language.lower()
+        ).translate(text)
+    except Exception as e:
+        logging.error(f"Translation failed: {e}")
+        return ""
 
 def sanitize_text(text: str, message: discord.Message) -> str:
     text = text.replace("@everyone", "EVERYONE")
