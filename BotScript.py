@@ -306,26 +306,20 @@ def load_active_guilds(guild_id):
 
 def load_guild_preferences(guild_id):
     key = f"PREFERENCES/{guild_id}-preferences.json"
-    try:
-        data = client.download_as_text(key)
-        return json.loads(data)
-    except (ObjectNotFoundError, FileNotFoundError):
-        return {}
+    return read_json_file(key, {})
 
 
 def save_guild_preferences(guild_id, preferences):
     key = f"PREFERENCES/{guild_id}-preferences.json"
-    client.upload_from_text(key, json.dumps(preferences))
-
+    write_json_file(key, preferences)
 
 def load_sessions_data():
-    try:
-        data = client.download_as_text("SESSIONS.json")
+    data = read_json_file("SESSIONS.json", {})
+    if data:
         logging.info("Successfully loaded SESSIONS.json")
-        return json.loads(data)
-    except (ObjectNotFoundError, FileNotFoundError):
-        logging.info("SESSIONS.json not found, creating a new one.")
-        return {}
+    else:
+        logging.info("SESSIONS.json not found or empty, using new one.")
+    return data
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
