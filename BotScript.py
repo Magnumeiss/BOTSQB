@@ -1031,7 +1031,8 @@ async def sq_info(interaction: discord.Interaction,
     await interaction.response.defer(ephemeral=False)
 
     filename = "SQUADRONS.json"
-    squadrons_json = client.download_as_text(filename)
+    with open(filename, "r", encoding="utf-8") as f:
+    squadrons_json = f.read()
     squadrons = json.loads(squadrons_json)
     guild_id = str(interaction.guild_id)
 
