@@ -8,7 +8,7 @@ from io import StringIO
 
 import aiofiles
 
-from src_send.WtFileUtils.vromfs.VROMFs import VROMFs
+from WtFileUtils.vromfs.VROMFs import VROMFs
 
 # lang_dir.dump_files("lang")
 
