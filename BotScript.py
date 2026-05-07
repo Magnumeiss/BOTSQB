@@ -14,7 +14,7 @@ import traceback
 from contextlib import suppress
 from datetime import datetime, time, timezone
 
-import deepl
+from deep_translator import GoogleTranslator
 import discord
 from discord import ButtonStyle, Color, Embed, Interaction, app_commands
 from discord.ext import commands, tasks
