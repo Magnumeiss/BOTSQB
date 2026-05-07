@@ -1280,20 +1280,18 @@ async def top(interaction: discord.Interaction):
 
 async def load_features(guild_id):
     key = f"FEATURES/{guild_id}-features.json"
-    try:
-        data = client.download_as_text(key)
-        return json.loads(data)
+    features = read_json_file(key, None)
 
-    except (ObjectNotFoundError, FileNotFoundError):
-        # If file doesn't exist, create it with default values
+    if features is None:
         features = {"Translate": "False", "Language": "<English>"}
-        client.upload_from_text(key, json.dumps(features))
-        return features
+        write_json_file(key, features)
+
+    return features
 
 
 async def save_features(guild_id, features):
     key = f"FEATURES/{guild_id}-features.json"
-    client.upload_from_text(key, json.dumps(features))
+    write_json_file(key, features)
 
 
 @bot.tree.command(name="toggle", description="Toggle a feature for the server (Currently supports 'Translate')")
