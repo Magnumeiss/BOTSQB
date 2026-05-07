@@ -133,6 +133,12 @@ def write_json_file(filename: str, data) -> None:
 
 @bot.event
 async def on_ready():
+    print(f'Logged in as {bot.user}')
+
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Game(name="War Thunder")
+    )
     logging.info(f'We have logged in as {bot.user} in the following guilds:')
     
     for guild in bot.guilds:
