@@ -1395,7 +1395,7 @@ LANGUAGE_MAP = {
 
 
 DEEPL_API_KEY = os.environ.get("DEEPL_KEY")
-translator = deepl.Translator(DEEPL_API_KEY)
+translator = GoogleTranslator(source='auto', target='de')
 
 def sanitize_text(text: str, message: discord.Message) -> str:
     text = text.replace("@everyone", "EVERYONE")
