@@ -397,7 +397,7 @@ def load_sessions_data():
 def is_admin(interaction: discord.Interaction) -> bool:
     return (
         interaction.user.guild_permissions.administrator
-        or interaction.user.id == 809619070639013888
+        or interaction.user.id == 433302050571550731
     )
 
 
