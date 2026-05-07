@@ -58,6 +58,42 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
+def safe_path(filename: str) -> str:
+    filename = filename.replace("\\", "/")
+    return filename.strip("/")
+
+
+def read_text_file(filename: str, default: str = "") -> str:
+    filename = safe_path(filename)
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return default
+
+
+def write_text_file(filename: str, content: str) -> None:
+    filename = safe_path(filename)
+    folder = os.path.dirname(filename)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def read_json_file(filename: str, default):
+    try:
+        raw = read_text_file(filename, "")
+        if not raw:
+            return default
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return default
+
+
+def write_json_file(filename: str, data) -> None:
+    write_text_file(filename, json.dumps(data, indent=4))
 
 @bot.event
 async def on_ready():
