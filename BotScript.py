@@ -115,7 +115,8 @@ async def on_guild_join(guild):
 
     if guild_id not in guilds:
         guilds.append(guild_id)
-        client.upload_from_text(key, json.dumps(guilds))
+        with open(filename, "w", encoding="utf-8") as f:
+    f.write(squadrons_json) 
 
 
 @tasks.loop(hours=2)
