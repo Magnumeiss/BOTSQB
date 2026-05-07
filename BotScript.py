@@ -20,8 +20,44 @@ from discord import ButtonStyle, Color, Embed, Interaction, app_commands
 from discord.ext import commands, tasks
 from discord.ui import View, button
 from discord.utils import escape_markdown
-from replit.object_storage import Client
-from replit.object_storage.errors import ObjectNotFoundError
+class ObjectNotFoundError(FileNotFoundError):
+    pass
+
+
+class LocalStorageClient:
+    def __init__(self, bucket_id=None):
+        self.bucket_id = bucket_id
+
+    def _path(self, object_name):
+        object_name = object_name.replace("\\", "/").strip("/")
+        return object_name
+
+    def download_as_text(self, object_name):
+        path = self._path(object_name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            raise ObjectNotFoundError(path)
+
+    def upload_from_text(self, object_name, text):
+        path = self._path(object_name)
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def upload_from_filename(self, object_name, filename):
+        path = self._path(object_name)
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        shutil.copyfile(filename, path)
+
+
+Client = LocalStorageClient
 
 # Local Module Imports
 import Alarms
