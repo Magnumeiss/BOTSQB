@@ -1413,7 +1413,7 @@ def sanitize_text(text: str, message: discord.Message) -> str:
 
 
 def perform_translation(text: str, target_language: str) -> str:
-    result = translator.translate_text(text, target_lang=target_language.upper())
+    result = translator.translate(text, target_lang=target_language.upper())
     return result.text
 
 
