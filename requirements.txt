@@ -9,3 +9,4 @@ aiofiles
 aiohttp
 deepl
 WtFileUtils==0.1.2
+Pillow
