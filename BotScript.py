@@ -1033,7 +1033,7 @@ async def sq_info(interaction: discord.Interaction,
 
     filename = "SQUADRONS.json"
     with open(filename, "r", encoding="utf-8") as f:
-    squadrons_json = f.read()
+        squadrons_json = f.read()
     squadrons = json.loads(squadrons_json)
     guild_id = str(interaction.guild_id)
 
