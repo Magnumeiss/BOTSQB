@@ -1,173 +1,235 @@
 import os
 import re
-import sys
-from datetime import datetime
 import json
+import requests
 
-def parse_replay(folder):
+WEBHOOK_URL = "https://discord.com/api/webhooks/1531415196323545259/GvEJ8NtYZDeKiotyGJ2TVITRDOMzKFTHECWfm8XKITugf0U5keNsl6zjLdidjBmHa9F8"
+
+IGNORE_KEYWORDS = {
+    "http", "https", "warthunder", "wt-game-replays", "arcade", "realistic",
+    "simulation", "clanbattle", "domination", "conquest", "battle", "mission",
+    "author", "type", "version", "level", "game", "user", "name", "clan"
+}
+
+
+def load_german_json(filepath="german.json"):
     """
-    parse a replay which is stored in a folder
-    Assumes "folder" is a directory with replay files 0000.wrpl, 0001.wrpl ...
+    Loads german.json to map internal vehicle IDs to display names.
     """
+    if not os.path.exists(filepath):
+        print(f"[!] '{filepath}' not found in current directory.")
+        return {}
 
-    replay_files = _get_files(folder)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
 
-    players = []
-    for file in replay_files:
-        print(f"parsing {file}")
-        players += _parse_replay_file(file)
-    
-    # join the playerids
-    players2 = []
+    id_to_display = {}
+    vehicles_dict = data.get("vehicles", {})
+    if isinstance(vehicles_dict, dict):
+        for category, item_dict in vehicles_dict.items():
+            if isinstance(item_dict, dict):
+                for display_name, internal_id in item_dict.items():
+                    if isinstance(internal_id, str) and len(internal_id) > 2:
+                        id_to_display[internal_id] = display_name
 
-    for pid in set([p["player_id"] for p in players]):
-        vehicles = []
-        for v in list(set([p["vehicle"] for p in players if p["player_id"] == pid])):
-            vehicles.append(
-                {
-                    "vehicle": v,
-                    "num_appearances": len([p for p in players if p["player_id"] == pid and p["vehicle"] == v])
-                }
-            )
-        players2.append({
-            "player_id" : pid,
-            "vehicles": vehicles,
-            "num_appearances": len([p for p in players if p["player_id"] == pid])
-        })
+    print(f"[+] Loaded {len(id_to_display)} vehicle definitions from '{filepath}'")
+    return id_to_display
 
-    data = _get_metadata(folder)
-    data['num_players'] = len(players2)
-    data['players'] = players2
 
-    return data
-
-def _get_text(bstring, letters=None):
+def decompress_wrpl(file_path):
     """
-    from a binary string, return a text string where only the allowed letters are in
+    Decompresses all Zstandard blocks in a .wrpl file into a byte stream.
     """
+    if not os.path.exists(file_path):
+        return b""
 
-    if letters is None:
-        letters = list(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890-_")
+    with open(file_path, 'rb') as f:
+        raw_data = f.read()
 
-    text = ""
-    idx = 0
-    while (letter := bstring[idx]) in letters and idx < len(bstring):
-        text += chr(letter)
-        idx += 1
+    decompressed = bytearray(raw_data)
+    try:
+        import zstandard as zstd
+        dctx = zstd.ZstdDecompressor()
+        zstd_magic = b'\x28\xb5\x2f\xfd'
+        for m in re.finditer(re.escape(zstd_magic), raw_data):
+            try:
+                decomp = dctx.decompress(raw_data[m.start():], max_output_size=15 * 1024 * 1024)
+                decompressed.extend(decomp)
+            except Exception:
+                pass
+    except ImportError:
+        pass
 
-    return text
+    return bytes(decompressed)
 
-def _get_metadata(folder):
+
+def extract_lineup_from_wrpl(file_path, id_to_display):
     """
-    get the metadata from the replay files
+    Dynamically finds vehicle IDs in the byte stream, creates a snippet window,
+    and pairs players with their vehicles.
     """
+    stream_data = decompress_wrpl(file_path)
+    if not stream_data:
+        return []
 
-    replay_file = os.path.join(folder, "0000.wrpl")
-    with open(replay_file, 'rb') as f:
-        replay = f.read()
-
-    dir_letters = list(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890-_/.")
-
-    # level can be found at the position 0x8 to 0x87
-    level = _get_text(replay[0x8:0x88], letters=dir_letters)
-
-    # mission file can be found at position 0x88 to 0x18b
-    mission_file = _get_text(replay[0x88:0x18c], letters=dir_letters)
-
-    # mission name can be found at position 0x18c to 0x20b
-    mission_name = _get_text(replay[0x18c:0x20c])
-
-    # time of day can be found at position 0x20c to 0x28b
-    time_of_day = _get_text(replay[0x20c:0x28c])
-
-    # wheather cna be found at position 0x28c to 0x2af
-    weather = _get_text(replay[0x28c:0x2b0])
-
-    # time of battle can be found at position 0x388 to 0x38b
-    time_of_battle_ts = int.from_bytes(replay[0x388:0x38c], byteorder='little')
-    time_of_battle = datetime.fromtimestamp(time_of_battle_ts).strftime('%Y-%m-%d %H:%M:%S')
-
-    return {
-        "level" : level,
-        "mission_file" : mission_file,
-        "mission_name" : mission_name,
-        "time_of_day" : time_of_day,
-        "weather" : weather,
-        "time_of_battle_ts" : time_of_battle_ts,
-        "time_of_battle" : time_of_battle,
-    }
-
-
-def _get_files(folder):
-    """
-    get the replay files
-    """
-
-    dirfiles = [os.path.join(folder, f) for f in os.listdir(folder)]
-
-    # Currently we are only looking for files like 0000.wrpl, 0001.wrpl ...
-    # (this is how https://warthunder.com/en/tournament/replay/ names replays)
-    files_match = ".*\d\d\d\d.wrpl$"
-
-    files = sorted([os.path.abspath(f) for f in dirfiles if re.search(files_match, f)])
-
-    return files
-
-
-def _parse_replay_file(path):
-    """
-    parse a single replay files and return instances of vehicles
-    """
-
-    # allowed letters for vehicle names
-    # letters = list(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890-_")
-
-    # magic which preceds vehicles
-    magic = re.compile(b'\x01\x20\x01')
-
-    # vehicles which are not player vehicles
-    ignored_vehicles = ["dummy_plane"]
-
-    with open(path, 'rb') as f:
-        replay = f.read()
-        
-    players = []
-
-    # find all magics in the replay file
-    for m in magic.finditer(replay):
-
-        vehicle_name_max_len = 30
+    # 1. Locate all vehicle ID byte occurrences in the stream
+    vehicle_occurrences = []
+    for v_id, display_name in id_to_display.items():
+        if not isinstance(v_id, str):
+            continue
 
         try:
-            vehicle = _get_text(replay[m.start() + 4:m.start() + vehicle_name_max_len + 30])
-        
-            # only if the vehicle name is at least 2 letters, it is actually not garbage
-            if len(vehicle) > 2 and vehicle not in ignored_vehicles:
+            v_bytes = v_id.encode('utf-8')
+        except Exception:
+            continue
 
-                # player id can be founx at the position m.start() - 4
-                player_id = replay[m.start() - 4]
+        pos = stream_data.find(v_bytes)
+        while pos != -1:
+            vehicle_occurrences.append((pos, v_id, display_name))
+            pos = stream_data.find(v_bytes, pos + len(v_bytes))
 
-                players.append({"player_id" : player_id, "vehicle" : vehicle})
-        except:
-            pass
-    
-    return players
+    if not vehicle_occurrences:
+        return []
+
+    # Sort occurrences by position in the binary file
+    vehicle_occurrences.sort(key=lambda x: x[0])
+
+    # 2. Extract snippet window around the summary block
+    first_pos = vehicle_occurrences[0][0]
+    last_pos = vehicle_occurrences[-1][0]
+
+    snippet_start = max(0, first_pos - 600)
+    snippet_end = min(len(stream_data), last_pos + 1200)
+    snippet = stream_data[snippet_start:snippet_end]
+
+    # Extract ASCII/UTF-8 tokens from snippet
+    raw_tokens = [s.decode('utf-8', errors='ignore') for s in re.findall(b'[A-Za-z0-9_\\-\\./@]{3,}', snippet)]
+
+    # 3. Collect unique vehicles in order of appearance
+    found_vehicles = []
+    for token in raw_tokens:
+        if token in id_to_display and token not in found_vehicles:
+            found_vehicles.append(token)
+
+    # 4. Collect potential player names in order of appearance
+    found_players = []
+    for token in raw_tokens:
+        token_lower = token.lower()
+        if (token not in id_to_display and
+            not any(kw in token_lower for kw in IGNORE_KEYWORDS) and
+            token not in found_players):
+            found_players.append(token)
+
+    # 5. Pair 1:1
+    lineup = []
+    limit = min(len(found_players), len(found_vehicles))
+    for i in range(limit):
+        v_id = found_vehicles[i]
+        lineup.append({
+            "player_name": found_players[i],
+            "vehicle_id": v_id,
+            "vehicle_name": id_to_display.get(v_id, v_id)
+        })
+
+    return lineup
+
+
+def send_markdown_to_discord(parsed_replays):
+    """
+    Sends Discord Markdown formatted summary messages and attaches parsed_replays.json.
+    """
+    print("\n[*] Sending Discord Markdown report to webhook...")
+
+    header_md = (
+        f"# 🎮 War Thunder Replay Lineup Report\n"
+        f"**Replays Processed:** `{len(parsed_replays)}` | **Status:** `Success`\n"
+        f"──────────────────────────────────────────────\n"
+    )
+
+    chunks = [header_md]
+    current_chunk = header_md
+
+    for replay in parsed_replays:
+        r_id = replay["replay_id"]
+        players = replay["players"]
+
+        replay_md = f"### 📁 Replay ID: `{r_id}`\n"
+        replay_md += f"**Size:** `{replay['file_size_kb']} KB` | **Players:** `{len(players)}` \n```\n"
+
+        if players:
+            for p in players:
+                replay_md += f"{p['player_name']:<22} -> {p['vehicle_name']} ({p['vehicle_id']})\n"
+        else:
+            replay_md += "No lineup summary block extracted for this file.\n"
+
+        replay_md += "```\n"
+
+        # Split into <2000 character chunks for Discord limit
+        if len(current_chunk) + len(replay_md) > 1900:
+            chunks.append(replay_md)
+            current_chunk = replay_md
+        else:
+            chunks[-1] += replay_md
+            current_chunk += replay_md
+
+    # POST Markdown chunks to Discord
+    for idx, chunk in enumerate(chunks, start=1):
+        payload = {"content": chunk}
+        res = requests.post(WEBHOOK_URL, json=payload)
+        if res.status_code in (200, 204):
+            print(f"  [+] Sent Markdown message chunk {idx}/{len(chunks)}")
+        else:
+            print(f"  [!] Failed chunk {idx}: HTTP {res.status_code}")
+
+    # Attach parsed_replays.json file
+    output_filename = "parsed_replays.json"
+    try:
+        with open(output_filename, "rb") as f:
+            res = requests.post(
+                WEBHOOK_URL,
+                data={"payload_json": json.dumps({"content": "📎 **Attached Full JSON Dataset:**"})},
+                files={"file": (output_filename, f, "application/json")}
+            )
+        if res.status_code in (200, 204):
+            print("  [+] Successfully attached parsed_replays.json to Discord.")
+    except Exception as e:
+        print(f"  [!] Could not attach JSON file: {e}")
 
 
 def main():
+    id_to_display = load_german_json("german.json")
 
-    # if we have an argument, use this as path, otherwise use current folder
-    try:
-        folder = os.path.abspath(sys.argv[1])
-    except:
-        folder = os.getcwd()
+    folders = [d for d in os.listdir('.') if os.path.isdir(d)]
+    parsed_replays = []
 
-    print(f"parsing replay in {folder}")
+    print(f"\n[*] Processing {len(folders)} replay folder(s)...")
 
-    data = parse_replay(folder)
+    for folder in sorted(folders):
+        wrpl_path = os.path.join(folder, "0001.wrpl")
+        if not os.path.exists(wrpl_path):
+            continue
 
-    print()
-    print(json.dumps(data, indent=4))
+        size_kb = round(os.path.getsize(wrpl_path) / 1024, 2)
+        lineup = extract_lineup_from_wrpl(wrpl_path, id_to_display)
+
+        replay_entry = {
+            "replay_id": folder,
+            "file_size_kb": size_kb,
+            "num_players": len(lineup),
+            "players": lineup
+        }
+        parsed_replays.append(replay_entry)
+        print(f"  [+] Replay ID '{folder}': {len(lineup)} player/vehicle match(es)")
+
+    output_filename = "parsed_replays.json"
+    with open(output_filename, "w", encoding="utf-8") as f:
+        json.dump(parsed_replays, f, indent=4, ensure_ascii=False)
+
+    print(f"\n[+] Saved parsed output to '{output_filename}'")
+
+    if parsed_replays:
+        send_markdown_to_discord(parsed_replays)
+
 
 if __name__ == "__main__":
     main()
