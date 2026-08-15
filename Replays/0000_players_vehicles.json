@@ -1,0 +1,386 @@
+{
+  "format": "war_thunder_relay_players_vehicles_v1",
+  "sessions": [
+    "06fc22a4000e9ac9"
+  ],
+  "replay_parts": [
+    0
+  ],
+  "source_files": [
+    "C:\\Users\\magma\\Rinossigmabot\\BOTSQB\\Replays\\0000.wrpl"
+  ],
+  "match": {
+    "level": "levels/avg_syria.bin",
+    "battle_type": "middle_east_Dom",
+    "battle_class": "air_ground_Dom",
+    "location_name": "missions/_Dom;middle_east/name",
+    "start_time_unix": 1785184278
+  },
+  "diagnostics": {
+    "packet_count": 546,
+    "time_min_ms": 3524,
+    "time_max_ms": 4695,
+    "observed_span_ms": 1171,
+    "slot_packets": 5,
+    "vehicle_events": 0,
+    "ecs_creation_packets": 10,
+    "ecs_entities_with_exact_parse": 1,
+    "ecs_errors": [
+      {
+        "replay_part": 0,
+        "packet_seq": 1,
+        "time_ms": 3524,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 4,
+        "time_ms": 3558,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 20,
+        "time_ms": 3751,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 135,
+        "time_ms": 3850,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 148,
+        "time_ms": 3891,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 177,
+        "time_ms": 3927,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 208,
+        "time_ms": 3964,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 396,
+        "time_ms": 4391,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      },
+      {
+        "replay_part": 0,
+        "packet_seq": 409,
+        "time_ms": 4426,
+        "error": "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+      }
+    ],
+    "slot_packet_errors": [
+      {
+        "replay_part": 0,
+        "packet_seq": 538,
+        "time_ms": 4695,
+        "error": "This slot packet is Zstd-compressed. Install support with: py -m pip install zstandard"
+      }
+    ],
+    "vehicle_packet_errors": [],
+    "unmatched_vehicle_events": [],
+    "important_note": "Vehicle names are reported only when directly evidenced by supported combat packets or by an owned/controlled ECS entity's exact unit__className. The pre-spawn ECS placeholder 'dummy_plane' and unrelated mission/NPC vehicle strings are intentionally not reported as player vehicles."
+  },
+  "players": [
+    {
+      "slot": 0,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194431
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 1,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194432
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 2,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194433
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 3,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194434
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 4,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194435
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 5,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194436
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 6,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194437
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 7,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194438
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 8,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194439
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 9,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194440
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 10,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194441
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 11,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194442
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 12,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194443
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 13,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194444
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 14,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194445
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    },
+    {
+      "slot": 15,
+      "player_id": null,
+      "name": "",
+      "real_nick": "",
+      "clan_tag": "",
+      "title": "",
+      "team": null,
+      "vehicles": [],
+      "vehicle_status": "not_observed_in_supplied_relay_parts",
+      "owned_unit_eids": [
+        4194446
+      ],
+      "controlled_unit_eids": [],
+      "owned_unit_entities": [],
+      "controlled_unit_entities": [],
+      "vehicle_evidence": []
+    }
+  ]
+}

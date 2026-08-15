@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""
+War Thunder server-relay WRPL REAL player/vehicle extractor.
+
+What it does:
+- validates/decompresses the WRPL zlib packet stream;
+- extracts player slot records (name, player ID, team, entity refs);
+- correlates directly evidenced vehicle names from kill/critical/severe-damage MPI packets;
+- NEVER treats "dummy_plane" or unrelated mission/NPC vehicle strings as player vehicles.
+
+IMPORTANT: pass ALL server replay parts from the same match. Part 0 often contains only pre-spawn placeholders. Example:
+    py wt_relay_players_vehicles.py "C:\\ReplayParts" -o players_vehicles.json
+
+Optional for Zstd-compressed slot packets:
+    py -m pip install zstandard
+The script also falls back to a system `zstd` executable when available.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import zlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
+
+SLOT_SIGNATURE = bytes.fromhex("02582df0")
+CRITICAL_SIGNATURE = bytes.fromhex("025856f0")
+SEVERE_SIGNATURE = bytes.fromhex("025857f1")
+KILL_SIGNATURE = bytes.fromhex("025858f0")
+
+# ECS hashes used for exact unit-class extraction.
+ECS_TRANSFORM_DATA_HASH = 0xE1AD931B
+ECS_UNIT_CLASSNAME_HASH = 0x1E9A352C
+TYPE_STORAGE_AIRCRAFT = 0xA357DB48
+TYPE_PARTID_LIST = 0x53533A06
+TYPE_BUFFERED_HUD = 0xADAE4F0F
+TYPE_BOOL = 0xC894953D
+TYPE_INT = 0x95E97E5E
+TYPE_STRING = 0x33E97A7B
+TYPE_EID = 0xFECA5ED4
+
+
+class ParseError(RuntimeError):
+    pass
+
+
+class BitReader:
+    """Bit reader matching War Thunder/Dagor's little-endian bitstream behavior."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.bit = 0
+
+    def remaining_bits(self) -> int:
+        return len(self.data) * 8 - self.bit
+
+    def read_bits(self, n: int) -> bytes:
+        if n < 0:
+            raise ParseError(f"negative bit count: {n}")
+        if n == 0:
+            return b""
+        if self.bit + n > len(self.data) * 8:
+            raise EOFError(
+                f"need {n} bits at {self.bit}, only {self.remaining_bits()} remain"
+            )
+
+        off = self.bit & 7
+        if off == 0 and n % 8 == 0:
+            i = self.bit >> 3
+            out = self.data[i : i + (n >> 3)]
+            self.bit += n
+            return out
+
+        out = bytearray((n + 7) // 8)
+        out_i = 0
+        remain = n
+        while remain > 0:
+            src_i = self.bit >> 3
+            out[out_i] |= (self.data[src_i] << off) & 0xFF
+            if off > 0 and remain > (8 - off):
+                if src_i + 1 >= len(self.data):
+                    raise EOFError("unaligned bit read exceeds buffer")
+                out[out_i] |= self.data[src_i + 1] >> (8 - off)
+
+            if remain >= 8:
+                remain -= 8
+                self.bit += 8
+                out_i += 1
+            else:
+                out[out_i] >>= 8 - remain
+                self.bit += remain
+                break
+        return bytes(out)
+
+    def read_byte(self) -> int:
+        return self.read_bits(8)[0]
+
+    def read_u16(self) -> int:
+        return int.from_bytes(self.read_bits(16), "little")
+
+    def read_u32(self) -> int:
+        return int.from_bytes(self.read_bits(32), "little")
+
+    def read_u64(self) -> int:
+        return int.from_bytes(self.read_bits(64), "little")
+
+    def read_compressed(self) -> int:
+        value = 0
+        count = 0
+        while True:
+            a = self.read_byte()
+            value |= (a & 0x7F) << (count * 7)
+            count += 1
+            if not (a & 0x80):
+                return value
+            if count > 10:
+                raise ParseError("compressed integer is unreasonably long")
+
+    def read_lenstr(self) -> str:
+        # MPI/template strings use one-byte lengths here.
+        n = self.read_byte()
+        return self.read_bits(n * 8).decode("utf-8", "replace")
+
+    def read_zstr(self) -> str:
+        out = bytearray()
+        while True:
+            b = self.read_byte()
+            if b == 0:
+                return out.decode("utf-8", "replace")
+            out.append(b)
+
+
+def read_eid_br(r: BitReader) -> int:
+    first16 = r.read_u16()
+    if first16 & 1:
+        return (first16 >> 2) | (((first16 & 2) >> 1) << 22)
+    if first16 & 2:
+        return (first16 >> 2) | (r.read_byte() << 22)
+    second16 = r.read_u16()
+    value = (second16 << 16) | first16
+    return ((value & 0x00FFFFFF) >> 2) | ((value >> 24) << 22)
+
+
+def read_field_size(r: BitReader) -> int:
+    hdr = r.read_bits(3)[0]
+    fixed = {1: 1, 2: 8, 3: 16, 4: 32, 5: 64, 6: 96, 7: 128}
+    if hdr in fixed:
+        return fixed[hdr]
+    return r.read_compressed()
+
+
+def aligned_to_byte(count: int) -> int:
+    if count <= 0:
+        return 0
+    return count + 8 - (((count - 1) & 7) + 1)
+
+
+def read_variable_length_size(data: bytes, pos: int) -> tuple[int, int]:
+    if pos >= len(data):
+        raise EOFError
+    first = data[pos]
+    pos += 1
+    if first & 0x80:
+        if first & 0x40:
+            raise ParseError(f"invalid packet-size prefix 0x{first:02x}")
+        return first & 0x7F, pos
+    if first & 0x40:
+        if pos >= len(data):
+            raise EOFError
+        return (((first << 8) | data[pos]) ^ 0x4000), pos + 1
+    if first & 0x20:
+        if pos + 2 > len(data):
+            raise EOFError
+        return (
+            ((first << 16) | (data[pos] << 8) | data[pos + 1]) ^ 0x200000,
+            pos + 2,
+        )
+    if first & 0x10:
+        if pos + 3 > len(data):
+            raise EOFError
+        return (
+            (
+                (first << 24)
+                | (data[pos] << 16)
+                | (data[pos + 1] << 8)
+                | data[pos + 2]
+            )
+            ^ 0x10000000,
+            pos + 3,
+        )
+    if pos + 4 > len(data):
+        raise EOFError
+    return struct.unpack_from("<I", data, pos)[0], pos + 4
+
+
+@dataclass
+class ReplayHeader:
+    path: str
+    version: int
+    level: str
+    level_settings: str
+    battle_type: str
+    environment: str
+    visibility: str
+    session_id: int
+    replay_part_number: int
+    is_server: bool
+    settings_blk_size: int
+    location_name: str
+    start_time_unix: int
+    time_limit: int
+    score_limit: int
+    battle_class: str
+
+    @property
+    def session_hex(self) -> str:
+        return f"{self.session_id:016x}"
+
+
+def cstr(data: bytes, off: int, size: int) -> str:
+    return data[off : off + size].split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def parse_header(path: Path, data: bytes) -> ReplayHeader:
+    if len(data) < 1234:
+        raise ParseError(f"{path.name}: file is too small for a WRPL header")
+    return ReplayHeader(
+        path=str(path),
+        version=struct.unpack_from("<i", data, 4)[0],
+        level=cstr(data, 8, 128),
+        level_settings=cstr(data, 136, 260),
+        battle_type=cstr(data, 396, 128),
+        environment=cstr(data, 524, 128),
+        visibility=cstr(data, 652, 32),
+        session_id=struct.unpack_from("<Q", data, 732)[0],
+        replay_part_number=data[740],
+        is_server=(data[742] == 0x5A),
+        settings_blk_size=struct.unpack_from("<H", data, 748)[0],
+        location_name=cstr(data, 780, 128),
+        start_time_unix=struct.unpack_from("<I", data, 908)[0],
+        time_limit=struct.unpack_from("<I", data, 912)[0],
+        score_limit=struct.unpack_from("<I", data, 916)[0],
+        battle_class=cstr(data, 968, 128),
+    )
+
+
+def decompress_wrpl_stream(data: bytes, header: ReplayHeader) -> tuple[bytes, int]:
+    start = 1234 + header.settings_blk_size
+    if start >= len(data):
+        raise ParseError(
+            f"zlib start {start} is outside file of {len(data)} bytes"
+        )
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(data[start:])
+        out += d.flush()
+    except zlib.error as e:
+        raise ParseError(f"WRPL zlib stream failed at offset {start}: {e}") from e
+    if not d.eof:
+        raise ParseError("WRPL zlib stream did not reach a valid end marker")
+    consumed = len(data[start:]) - len(d.unused_data)
+    return out, consumed
+
+
+@dataclass
+class Packet:
+    seq: int
+    time_ms: int
+    packet_type: int
+    header1: int
+    payload: bytes
+
+
+def iter_packets(stream: bytes) -> Iterable[Packet]:
+    pos = 0
+    current_time = 0
+    seq = 0
+    while pos < len(stream):
+        size, pos = read_variable_length_size(stream, pos)
+        if size == 0:
+            continue
+        if pos + 2 > len(stream):
+            raise ParseError(f"packet {seq}: truncated 2-byte packet header")
+        h0, h1 = stream[pos], stream[pos + 1]
+        pos += 2
+        if h0 & 0x10:
+            packet_type = h0 ^ 0x10
+            payload_size = size - 2
+        else:
+            packet_type = h0
+            if pos + 4 > len(stream):
+                raise ParseError(f"packet {seq}: missing timestamp")
+            current_time = struct.unpack_from("<I", stream, pos)[0]
+            pos += 4
+            payload_size = size - 6
+        if payload_size < 0:
+            raise ParseError(f"packet {seq}: negative payload size {payload_size}")
+        end = pos + payload_size
+        if end > len(stream):
+            raise ParseError(
+                f"packet {seq}: payload exceeds stream ({end} > {len(stream)})"
+            )
+        yield Packet(seq, current_time, packet_type, h1, stream[pos:end])
+        pos = end
+        seq += 1
+    if pos != len(stream):
+        raise ParseError(f"packet parser ended at {pos}, stream has {len(stream)} bytes")
+
+
+def decode_eid(raw: bytes) -> Optional[int]:
+    """Decode Dagor compact EntityId when a field contains enough bytes."""
+    try:
+        return read_eid_br(BitReader(raw))
+    except Exception:
+        return None
+
+
+def zstd_decompress(data: bytes, expected_size: Optional[int] = None) -> bytes:
+    try:
+        import zstandard as zstd  # type: ignore
+
+        dctx = zstd.ZstdDecompressor()
+        if expected_size:
+            return dctx.decompress(data, max_output_size=max(expected_size, 1))
+        return dctx.decompress(data)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ParseError(f"Python zstandard failed: {e}") from e
+
+    exe = shutil.which("zstd")
+    if exe:
+        proc = subprocess.run(
+            [exe, "-q", "-d", "-c"],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout
+        raise ParseError(
+            "zstd command failed: " + proc.stderr.decode("utf-8", "replace").strip()
+        )
+
+    raise ParseError(
+        "This slot packet is Zstd-compressed. Install support with: "
+        "py -m pip install zstandard"
+    )
+
+
+def read_object_ext_uid(r: BitReader) -> tuple[int, int]:
+    oid = r.read_u16()
+    ext_uid = 0xFFFFFFFF
+    if (oid & 0x7FF) == 0x7FF and oid != 0xFFFF:
+        ext_uid = r.read_compressed()
+    return oid, ext_uid
+
+
+def parse_id255_fields(msg: bytes) -> list[tuple[int, int, bytes]]:
+    r = BitReader(msg)
+    start = r.bit
+    offset = r.read_u16()
+    count = r.read_u16()
+    field_count = count & 0xFFF
+    bits_per_id = count >> 12
+    if field_count > 255:
+        raise ParseError(f"IdFieldSerializer255 field count too large: {field_count}")
+    start_body = r.bit
+
+    r.bit = start + offset * 8
+    sizes = [read_field_size(r) for _ in range(field_count)]
+
+    bits_for_indices = aligned_to_byte(bits_per_id * field_count)
+    r.bit = start_body - 32 + offset * 8 - bits_for_indices
+    indices: list[int] = []
+    mask = (1 << bits_per_id) - 1 if bits_per_id else 0
+    for _ in range(field_count):
+        b = r.read_bits(bits_per_id)
+        indices.append(int.from_bytes(b + b"\0\0", "little") & mask)
+
+    r.bit = start_body
+    fields = []
+    for idx, size in zip(indices, sizes):
+        fields.append((idx, size, r.read_bits(size)))
+    return fields
+
+
+def parse_id32_fields(body: bytes) -> dict[int, tuple[int, bytes]]:
+    r = BitReader(body)
+    start = r.bit
+    offset = r.read_u16()
+    fields_mask = r.read_compressed()
+    if fields_mask > 0xFFFFFFFF:
+        raise ParseError(f"IdFieldSerializer32 field mask too large: 0x{fields_mask:x}")
+    start_body = r.bit
+
+    field_nums = [i for i in range(32) if fields_mask & (1 << i)]
+    r.bit = start + offset * 8
+    sizes = [read_field_size(r) for _ in field_nums]
+
+    r.bit = start_body
+    out: dict[int, tuple[int, bytes]] = {}
+    for field_num, size in zip(field_nums, sizes):
+        out[field_num] = (size, r.read_bits(size))
+    return out
+
+
+def field_u32(fields: dict[int, tuple[int, bytes]], n: int) -> Optional[int]:
+    item = fields.get(n)
+    if not item or item[0] < 32:
+        return None
+    try:
+        return BitReader(item[1]).read_u32()
+    except Exception:
+        return None
+
+
+def field_lenstr(fields: dict[int, tuple[int, bytes]], n: int) -> Optional[str]:
+    item = fields.get(n)
+    if not item:
+        return None
+    try:
+        return BitReader(item[1]).read_lenstr()
+    except Exception:
+        return None
+
+
+class UnsupportedECSComponent(ParseError):
+    pass
+
+
+@dataclass
+class ECSEntityInfo:
+    eid: int
+    template: str
+    class_name: Optional[str]
+    replay_part: int
+    packet_seq: int
+    time_ms: int
+    class_source: str = ""
+    model_path: Optional[str] = None
+
+
+class ECSClassTracker:
+    """Minimal exact ECS construction parser focused on unit__className."""
+
+    def __init__(self) -> None:
+        self.templates: dict[int, tuple[str, list[int]]] = {}
+        self.components: dict[int, tuple[int, int]] = {}  # id -> (data-name hash, type hash)
+        self.entities: dict[int, ECSEntityInfo] = {}
+        self.errors: list[dict] = []
+        self.creation_packets = 0
+
+    @staticmethod
+    def _skip_transform(r: BitReader) -> None:
+        is_ortho_uni = bool(r.read_bits(1)[0])
+        if is_ortho_uni:
+            r.read_bits(62)
+            has_scale = bool(r.read_bits(1)[0])
+            if has_scale:
+                r.read_bits(32)
+        else:
+            r.read_bits(288)
+        r.read_bits(96)
+
+    @staticmethod
+    def _parse_component(r: BitReader, data_hash: int, type_hash: int):
+        if data_hash == ECS_TRANSFORM_DATA_HASH:
+            ECSClassTracker._skip_transform(r)
+            return None
+        if type_hash == TYPE_STORAGE_AIRCRAFT:
+            block_bits = r.read_compressed()
+            r.read_bits(block_bits)
+            return None
+        if type_hash == TYPE_PARTID_LIST:
+            count = r.read_compressed() << 3
+            r.read_bits(count * 6)
+            return None
+        if type_hash == TYPE_BUFFERED_HUD:
+            count = r.read_compressed()
+            r.read_bits(count * 8)
+            return None
+        if type_hash == TYPE_BOOL:
+            return bool(r.read_bits(1)[0])
+        if type_hash == TYPE_INT:
+            return int.from_bytes(r.read_bits(32), "little", signed=True)
+        if type_hash == TYPE_STRING:
+            return r.read_zstr()
+        if type_hash == TYPE_EID:
+            return read_eid_br(r)
+        raise UnsupportedECSComponent(
+            f"unsupported ECS type 0x{type_hash:08x} before unit__className"
+        )
+
+    def _parse_template(self, r: BitReader) -> tuple[int, str, list[int]]:
+        tid = r.read_compressed()
+        known = self.templates.get(tid)
+        if known is not None:
+            return tid, known[0], known[1]
+
+        name = r.read_lenstr()
+        count = r.read_u16()
+        comp_ids: list[int] = []
+        for _ in range(count):
+            cid = r.read_compressed()
+            comp_ids.append(cid)
+            if cid not in self.components:
+                name_hash = r.read_u32()
+                type_hash = r.read_u32()
+                self.components[cid] = (name_hash, type_hash)
+        self.templates[tid] = (name, comp_ids)
+        return tid, name, comp_ids
+
+    def _parse_entity_block(self, block: bytes) -> tuple[str, Optional[str]]:
+        r = BitReader(block)
+        _tid, template_name, comp_ids = self._parse_template(r)
+        template_count = len(comp_ids)
+        comp_count = r.read_byte() if template_count < 256 else r.read_compressed()
+        comp_index = 0
+        class_name: Optional[str] = None
+
+        for i in range(comp_count):
+            ofs = r.read_byte() if template_count < 256 else r.read_compressed()
+            comp_index = ofs if i == 0 else comp_index + ofs + 1
+            if comp_index >= template_count:
+                raise ParseError(
+                    f"ECS component index {comp_index} outside template {template_name!r}"
+                )
+            cid = comp_ids[comp_index]
+            if cid not in self.components:
+                raise ParseError(f"unknown ECS component id {cid}")
+            data_hash, type_hash = self.components[cid]
+            value = self._parse_component(r, data_hash, type_hash)
+            if data_hash == ECS_UNIT_CLASSNAME_HASH:
+                class_name = str(value) if value is not None else None
+                # No need to deserialize later components for vehicle identification.
+                break
+        return template_name, class_name
+
+    def process(self, pk: Packet, replay_part: int) -> None:
+        if pk.packet_type != 6 or not pk.payload:
+            return
+        control = pk.payload[0]
+        if control not in (0x24, 0x25):
+            return
+        self.creation_packets += 1
+        try:
+            if control == 0x25:
+                try:
+                    import lz4.block  # type: ignore
+                except ImportError as e:
+                    raise ParseError(
+                        "ECS creation is LZ4-compressed; install: py -m pip install lz4"
+                    ) from e
+                raw = lz4.block.decompress(
+                    pk.payload[1:], uncompressed_size=max((len(pk.payload) - 1) * 8, 1)
+                )
+            else:
+                raw = pk.payload[1:]
+
+            r = BitReader(raw)
+            message_count_minus_one = r.read_byte()
+            for _ in range(message_count_minus_one + 1):
+                eid = read_eid_br(r)
+                block_size = r.read_compressed()
+                block = r.read_bits(block_size * 8)
+                model_path = None
+                model_match = re.search(rb"tankModels/([A-Za-z0-9_+.-]+)", block)
+                if model_match:
+                    model_path = model_match.group(0).decode("ascii", "strict")
+                try:
+                    template, class_name = self._parse_entity_block(block)
+                    class_source = "unit__className" if class_name else ""
+                except UnsupportedECSComponent:
+                    # Ground-player entities currently contain serializer types that are not
+                    # needed to identify the vehicle.  The template itself is still parsed
+                    # exactly, and tankModels/<class> is a literal model resource path inside
+                    # this *same EID construction block*.  Use it only for tank+player_unit.
+                    rr = BitReader(block)
+                    _tid, template, _comp_ids = self._parse_template(rr)
+                    class_name = None
+                    class_source = ""
+                if (
+                    not class_name
+                    and template == "tank+player_unit"
+                    and model_path is not None
+                ):
+                    class_name = model_path.split("/", 1)[1]
+                    class_source = "tankModels_path_same_entity"
+                self.entities[eid] = ECSEntityInfo(
+                    eid=eid,
+                    template=template,
+                    class_name=class_name,
+                    replay_part=replay_part,
+                    packet_seq=pk.seq,
+                    time_ms=pk.time_ms,
+                    class_source=class_source,
+                    model_path=model_path,
+                )
+        except Exception as e:
+            self.errors.append(
+                {
+                    "replay_part": replay_part,
+                    "packet_seq": pk.seq,
+                    "time_ms": pk.time_ms,
+                    "error": str(e),
+                }
+            )
+
+
+@dataclass
+class VehicleEvidence:
+    vehicle: str
+    source: str
+    replay_part: int
+    packet_seq: int
+    time_ms: int
+    eid: Optional[int] = None
+
+
+@dataclass
+class UnitRefEvidence:
+    eid: int
+    source: str
+    replay_part: int
+    packet_seq: int
+    time_ms: int
+
+
+@dataclass
+class PlayerRecord:
+    slot: Optional[int] = None
+    player_id: Optional[int] = None
+    name: str = ""
+    real_nick: str = ""
+    clan_tag: str = ""
+    title: str = ""
+    team: Optional[int] = None
+    owned_unit_eids: set[int] = field(default_factory=set)
+    controlled_unit_eids: set[int] = field(default_factory=set)
+    owned_ref_events: list[UnitRefEvidence] = field(default_factory=list)
+    controlled_ref_events: list[UnitRefEvidence] = field(default_factory=list)
+    evidence: list[VehicleEvidence] = field(default_factory=list)
+
+    def add_unit_ref(self, eid: int, source: str, replay_part: int, packet_seq: int, time_ms: int) -> None:
+        target_set = self.controlled_unit_eids if source == "controlledUnitRef" else self.owned_unit_eids
+        target_events = self.controlled_ref_events if source == "controlledUnitRef" else self.owned_ref_events
+        target_set.add(eid)
+        key = (eid, source, replay_part, packet_seq, time_ms)
+        if any((x.eid, x.source, x.replay_part, x.packet_seq, x.time_ms) == key for x in target_events):
+            return
+        target_events.append(UnitRefEvidence(eid, source, replay_part, packet_seq, time_ms))
+
+    def add_vehicle(self, ev: VehicleEvidence) -> None:
+        # Ignore known pre-spawn placeholders by design.
+        v = ev.vehicle.strip()
+        if not v or v == "dummy_plane":
+            return
+        key = (v, ev.source, ev.replay_part, ev.packet_seq, ev.time_ms)
+        if any(
+            (x.vehicle, x.source, x.replay_part, x.packet_seq, x.time_ms) == key
+            for x in self.evidence
+        ):
+            return
+        self.evidence.append(ev)
+
+    def vehicles(self) -> list[str]:
+        return sorted({x.vehicle for x in self.evidence}, key=str.casefold)
+
+    def main_vehicles(self) -> list[str]:
+        # ownedUnitRef is the player's spawned main unit. The initial dummy_plane
+        # placeholder has already been rejected by add_vehicle/apply_ecs_evidence.
+        return sorted(
+            {x.vehicle for x in self.evidence if x.source.startswith("owned_ecs_")},
+            key=str.casefold,
+        )
+
+    def auxiliary_vehicles(self) -> list[str]:
+        main = set(self.main_vehicles())
+        return sorted(
+            {x.vehicle for x in self.evidence if x.vehicle not in main},
+            key=str.casefold,
+        )
+
+
+class Collector:
+    def __init__(self) -> None:
+        self.by_player_id: dict[int, PlayerRecord] = {}
+        self.by_slot: dict[int, PlayerRecord] = {}
+        self.unmatched_vehicle_events: list[dict] = []
+        self.slot_packet_errors: list[dict] = []
+        self.vehicle_packet_errors: list[dict] = []
+        self.packet_count = 0
+        self.slot_packet_count = 0
+        self.vehicle_event_count = 0
+        self.ecs = ECSClassTracker()
+        self.min_time: Optional[int] = None
+        self.max_time: Optional[int] = None
+
+    def get_slot_player(self, slot: int) -> PlayerRecord:
+        if slot not in self.by_slot:
+            self.by_slot[slot] = PlayerRecord(slot=slot)
+        return self.by_slot[slot]
+
+    def bind_id(self, rec: PlayerRecord, pid: int) -> PlayerRecord:
+        existing = self.by_player_id.get(pid)
+        if existing is not None and existing is not rec:
+            # Merge slot data into the ID-keyed record.
+            if rec.slot is not None and existing.slot is None:
+                existing.slot = rec.slot
+            if rec.name and not existing.name:
+                existing.name = rec.name
+            if rec.team is not None and existing.team is None:
+                existing.team = rec.team
+            existing.owned_unit_eids |= rec.owned_unit_eids
+            existing.controlled_unit_eids |= rec.controlled_unit_eids
+            existing.owned_ref_events.extend(x for x in rec.owned_ref_events if x not in existing.owned_ref_events)
+            existing.controlled_ref_events.extend(x for x in rec.controlled_ref_events if x not in existing.controlled_ref_events)
+            if rec.slot is not None:
+                self.by_slot[rec.slot] = existing
+            rec = existing
+        rec.player_id = pid
+        self.by_player_id[pid] = rec
+        return rec
+
+    def update_time(self, t: int) -> None:
+        self.min_time = t if self.min_time is None else min(self.min_time, t)
+        self.max_time = t if self.max_time is None else max(self.max_time, t)
+
+    def process_slot_packet(self, pk: Packet, replay_part: int) -> None:
+        self.slot_packet_count += 1
+        try:
+            r = BitReader(pk.payload[4:])
+            data_compressed = r.read_byte()
+            if data_compressed:
+                _compressed_size = r.read_compressed()
+                decomp_size = r.read_compressed()
+                compressed = r.read_bits(r.remaining_bits())
+                slot_data = zstd_decompress(compressed, decomp_size)
+            else:
+                slot_data = r.read_bits(r.remaining_bits())
+
+            sr = BitReader(slot_data)
+            message_count = sr.read_u16()
+            if message_count > 10000:
+                raise ParseError(f"unreasonable slot message count: {message_count}")
+
+            for _ in range(message_count):
+                message_len = sr.read_u16()
+                before = sr.bit
+                oid, _ext_uid = read_object_ext_uid(sr)
+                consumed = (sr.bit - before) >> 3
+                body_len = message_len - consumed
+                if body_len < 0:
+                    raise ParseError("negative slot message payload length")
+                message = sr.read_bits(body_len * 8)
+                if (oid >> 11) != 0xE:
+                    continue
+                slot = oid & 0x7FF
+                if slot > 255:
+                    continue
+                rec = self.get_slot_player(slot)
+                fields = parse_id255_fields(message)
+                for field_num, size, raw in fields:
+                    rr = BitReader(raw)
+                    try:
+                        if field_num == 2 and size >= (8 + 65) * 8:
+                            pid = rr.read_u64()
+                            name = (
+                                rr.read_bits(65 * 8)
+                                .rstrip(b"\0")
+                                .decode("utf-8", "replace")
+                            )
+                            rec = self.bind_id(rec, pid)
+                            rec.name = name
+                        elif field_num == 5:
+                            rec.clan_tag = rr.read_lenstr()
+                        elif field_num == 6:
+                            rec.title = rr.read_lenstr()
+                        elif field_num == 9 and size >= 8:
+                            rec.team = rr.read_byte()
+                        elif field_num == 34:
+                            eid = decode_eid(raw)
+                            if eid is not None:
+                                rec.add_unit_ref(eid, "ownedUnitRef", replay_part, pk.seq, pk.time_ms)
+                        elif field_num == 35:
+                            eid = decode_eid(raw)
+                            if eid is not None:
+                                rec.add_unit_ref(eid, "controlledUnitRef", replay_part, pk.seq, pk.time_ms)
+                        elif field_num == 41:
+                            rec.real_nick = rr.read_lenstr()
+                    except Exception:
+                        # A malformed optional field must not erase already valid player data.
+                        continue
+        except Exception as e:
+            self.slot_packet_errors.append(
+                {
+                    "replay_part": replay_part,
+                    "packet_seq": pk.seq,
+                    "time_ms": pk.time_ms,
+                    "error": str(e),
+                }
+            )
+
+    def add_vehicle_event(
+        self,
+        pid: Optional[int],
+        vehicle: Optional[str],
+        source: str,
+        replay_part: int,
+        pk: Packet,
+    ) -> None:
+        if pid is None or not vehicle or vehicle == "dummy_plane":
+            return
+        ev = VehicleEvidence(vehicle, source, replay_part, pk.seq, pk.time_ms, None)
+        self.vehicle_event_count += 1
+        rec = self.by_player_id.get(pid)
+        if rec is None:
+            self.unmatched_vehicle_events.append(
+                {
+                    "player_id": pid,
+                    "vehicle": vehicle,
+                    "source": source,
+                    "replay_part": replay_part,
+                    "packet_seq": pk.seq,
+                    "time_ms": pk.time_ms,
+                }
+            )
+            return
+        rec.add_vehicle(ev)
+
+    def process_vehicle_packet(self, pk: Packet, replay_part: int) -> None:
+        sig = pk.payload[:4]
+        try:
+            fields = parse_id32_fields(pk.payload[4:])
+            if sig == KILL_SIGNATURE:
+                # Kill packet: field 1 KillerPid, field 2 PlayerVehicle.
+                self.add_vehicle_event(
+                    field_u32(fields, 1),
+                    field_lenstr(fields, 2),
+                    "kill",
+                    replay_part,
+                    pk,
+                )
+            elif sig == CRITICAL_SIGNATURE:
+                # Critical damage: field 2 PlayerPID, field 3 Vehicle.
+                self.add_vehicle_event(
+                    field_u32(fields, 2),
+                    field_lenstr(fields, 3),
+                    "critical_damage",
+                    replay_part,
+                    pk,
+                )
+            elif sig == SEVERE_SIGNATURE:
+                # Severe damage: field 2 PlayerPID, field 3 Vehicle.
+                self.add_vehicle_event(
+                    field_u32(fields, 2),
+                    field_lenstr(fields, 3),
+                    "severe_damage",
+                    replay_part,
+                    pk,
+                )
+        except Exception as e:
+            self.vehicle_packet_errors.append(
+                {
+                    "replay_part": replay_part,
+                    "packet_seq": pk.seq,
+                    "time_ms": pk.time_ms,
+                    "signature": sig.hex(),
+                    "error": str(e),
+                }
+            )
+
+    def process_packets(self, packets: Iterable[Packet], replay_part: int) -> None:
+        for pk in packets:
+            self.packet_count += 1
+            self.update_time(pk.time_ms)
+            self.ecs.process(pk, replay_part)
+            if pk.packet_type == 4 and pk.payload.startswith(SLOT_SIGNATURE):
+                self.process_slot_packet(pk, replay_part)
+            if pk.packet_type == 4 and pk.payload[:4] in {
+                KILL_SIGNATURE,
+                CRITICAL_SIGNATURE,
+                SEVERE_SIGNATURE,
+            }:
+                self.process_vehicle_packet(pk, replay_part)
+
+    def apply_ecs_evidence(self) -> None:
+        """Resolve the player's spawned vehicle from slot unit refs and same-EID ECS data.
+
+        The initial ownedUnitRef points at an aircraft+player_unit/dummy_plane placeholder.
+        That placeholder is rejected.  Later ownedUnitRef values are the player's actual
+        spawned main unit; controlledUnitRef is also accepted when non-zero.
+        """
+        seen_objects: set[int] = set()
+        for rec in list(self.by_player_id.values()) + list(self.by_slot.values()):
+            if id(rec) in seen_objects:
+                continue
+            seen_objects.add(id(rec))
+            refs = [(x, "owned") for x in rec.owned_ref_events] + [
+                (x, "controlled") for x in rec.controlled_ref_events
+            ]
+            for ref, ref_kind in refs:
+                if ref.eid == 0:
+                    continue
+                info = self.ecs.entities.get(ref.eid)
+                if info is None or not info.class_name:
+                    continue
+                if info.template not in {"tank+player_unit", "aircraft+player_unit"}:
+                    continue
+                cls = info.class_name.strip()
+                if not cls or cls == "dummy_plane":
+                    continue
+                source = f"{ref_kind}_ecs_{info.class_source or 'vehicle_class'}"
+                rec.add_vehicle(
+                    VehicleEvidence(
+                        cls,
+                        source,
+                        info.replay_part,
+                        info.packet_seq,
+                        info.time_ms,
+                        ref.eid,
+                    )
+                )
+
+    def apply_unmatched_events(self) -> None:
+        still = []
+        for x in self.unmatched_vehicle_events:
+            rec = self.by_player_id.get(x["player_id"])
+            if rec is None:
+                still.append(x)
+                continue
+            rec.add_vehicle(
+                VehicleEvidence(
+                    x["vehicle"],
+                    x["source"],
+                    x["replay_part"],
+                    x["packet_seq"],
+                    x["time_ms"],
+                    None,
+                )
+            )
+        self.unmatched_vehicle_events = still
+
+
+def collect_input_files(inputs: list[str]) -> list[Path]:
+    found: list[Path] = []
+    for item in inputs:
+        p = Path(item)
+        if p.is_dir():
+            found.extend(sorted(p.glob("*.wrpl")))
+        elif p.is_file():
+            found.append(p)
+        else:
+            # Support shell-unexpanded globs on Windows.
+            found.extend(Path(x) for x in glob.glob(item))
+    unique: list[Path] = []
+    seen = set()
+    for p in found:
+        rp = str(p.resolve())
+        if rp not in seen:
+            unique.append(p)
+            seen.add(rp)
+    if not unique:
+        raise ParseError("No .wrpl input files found")
+    return unique
+
+
+def build_result(headers: list[ReplayHeader], c: Collector) -> dict:
+    c.apply_ecs_evidence()
+    c.apply_unmatched_events()
+    players = []
+    records = sorted(
+        set(id(x) for x in c.by_slot.values()) | set(id(x) for x in c.by_player_id.values())
+    )
+    # Recover unique objects while preserving slot order.
+    objs: list[PlayerRecord] = []
+    seen_obj = set()
+    for rec in list(c.by_slot.values()) + list(c.by_player_id.values()):
+        if id(rec) in seen_obj:
+            continue
+        seen_obj.add(id(rec))
+        objs.append(rec)
+    objs.sort(key=lambda x: (x.slot is None, x.slot if x.slot is not None else 9999, x.name))
+
+    for rec in objs:
+        vehicles = rec.vehicles()
+        main_vehicles = rec.main_vehicles()
+        auxiliary_vehicles = rec.auxiliary_vehicles()
+        controlled_nonzero = sorted(x for x in rec.controlled_unit_eids if x != 0)
+        sources = {e.source for e in rec.evidence}
+        if main_vehicles:
+            status = "resolved_main_vehicle_from_owned_unit"
+        elif any(src.startswith("controlled_ecs_") for src in sources):
+            status = "resolved_only_from_controlled_unit"
+        elif vehicles:
+            status = "resolved_only_from_combat_packet"
+        elif controlled_nonzero:
+            status = "controlled_entity_seen_but_vehicle_name_not_resolved"
+        else:
+            status = "not_observed_in_supplied_relay_parts"
+        players.append(
+            {
+                "slot": rec.slot,
+                "player_id": rec.player_id,
+                "name": rec.name,
+                "real_nick": rec.real_nick,
+                "clan_tag": rec.clan_tag,
+                "title": rec.title,
+                "team": rec.team,
+                "main_vehicles": main_vehicles,
+                "auxiliary_vehicles": auxiliary_vehicles,
+                "vehicles": vehicles,
+                "vehicle_status": status,
+                "owned_unit_eids": sorted(rec.owned_unit_eids),
+                "controlled_unit_eids": sorted(rec.controlled_unit_eids),
+                "controlled_unit_timeline": [
+                    {
+                        "eid": x.eid,
+                        "replay_part": x.replay_part,
+                        "packet_seq": x.packet_seq,
+                        "time_ms": x.time_ms,
+                        "resolved_class_name": (
+                            c.ecs.entities[x.eid].class_name if x.eid in c.ecs.entities else None
+                        ),
+                        "is_real_vehicle": bool(
+                            x.eid != 0
+                            and x.eid in c.ecs.entities
+                            and c.ecs.entities[x.eid].class_name
+                            and c.ecs.entities[x.eid].class_name != "dummy_plane"
+                        ),
+                    }
+                    for x in rec.controlled_ref_events
+                ],
+                "owned_unit_entities": [
+                    {
+                        "eid": eid,
+                        "template": c.ecs.entities[eid].template,
+                        "class_name": c.ecs.entities[eid].class_name,
+                        "class_source": c.ecs.entities[eid].class_source,
+                        "model_path": c.ecs.entities[eid].model_path,
+                    }
+                    for eid in sorted(rec.owned_unit_eids)
+                    if eid in c.ecs.entities
+                ],
+                "controlled_unit_entities": [
+                    {
+                        "eid": eid,
+                        "template": c.ecs.entities[eid].template,
+                        "class_name": c.ecs.entities[eid].class_name,
+                        "class_source": c.ecs.entities[eid].class_source,
+                        "model_path": c.ecs.entities[eid].model_path,
+                    }
+                    for eid in sorted(rec.controlled_unit_eids)
+                    if eid in c.ecs.entities
+                ],
+                "vehicle_evidence": [
+                    {
+                        "vehicle": e.vehicle,
+                        "source": e.source,
+                        "replay_part": e.replay_part,
+                        "packet_seq": e.packet_seq,
+                        "time_ms": e.time_ms,
+                        "eid": e.eid,
+                    }
+                    for e in rec.evidence
+                ],
+            }
+        )
+
+    session_ids = sorted({h.session_hex for h in headers})
+    parts = sorted({h.replay_part_number for h in headers})
+    return {
+        "format": "war_thunder_relay_real_vehicles_v4",
+        "sessions": session_ids,
+        "replay_parts": parts,
+        "source_files": [h.path for h in headers],
+        "match": {
+            "level": headers[0].level if headers else "",
+            "battle_type": headers[0].battle_type if headers else "",
+            "battle_class": headers[0].battle_class if headers else "",
+            "location_name": headers[0].location_name if headers else "",
+            "start_time_unix": headers[0].start_time_unix if headers else None,
+        },
+        "diagnostics": {
+            "packet_count": c.packet_count,
+            "time_min_ms": c.min_time,
+            "time_max_ms": c.max_time,
+            "observed_span_ms": (
+                c.max_time - c.min_time
+                if c.min_time is not None and c.max_time is not None
+                else None
+            ),
+            "slot_packets": c.slot_packet_count,
+            "vehicle_events": c.vehicle_event_count,
+            "ecs_creation_packets": c.ecs.creation_packets,
+            "ecs_entities_with_exact_parse": len(c.ecs.entities),
+            "ecs_errors": c.ecs.errors,
+            "slot_packet_errors": c.slot_packet_errors,
+            "vehicle_packet_errors": c.vehicle_packet_errors,
+            "unmatched_vehicle_events": c.unmatched_vehicle_events,
+            "important_note": (
+                "Vehicle names are reported only when tied to a player's ownedUnitRef/controlledUnitRef "
+                "and the same ECS player-unit entity, or by supported combat packets. Ground vehicles "
+                "use the literal tankModels/<class> path from that same tank+player_unit construction block "
+                "when unit__className cannot be reached due to an unsupported preceding serializer. "
+                "The pre-spawn ECS placeholder 'dummy_plane' is always rejected."
+            ),
+        },
+        "players": players,
+    }
+
+
+def print_summary(result: dict) -> None:
+    print(f"Session(s): {', '.join(result['sessions'])}")
+    print(f"Replay part(s): {result['replay_parts']}")
+    d = result["diagnostics"]
+    print(
+        f"Packets: {d['packet_count']} | time: {d['time_min_ms']}..{d['time_max_ms']} ms "
+        f"| span: {d['observed_span_ms']} ms"
+    )
+    print(f"Players: {len(result['players'])} | vehicle events: {d['vehicle_events']}")
+    print()
+    print(f"{'SLOT':>4}  {'TEAM':>4}  {'PLAYER ID':>12}  {'NAME':<24}  MAIN VEHICLE")
+    print("-" * 100)
+    for p in result["players"]:
+        main = ", ".join(p["main_vehicles"]) if p["main_vehicles"] else "<not resolved>"
+        aux = ", ".join(p["auxiliary_vehicles"])
+        suffix = f"  [aux: {aux}]" if aux else ""
+        print(
+            f"{str(p['slot']):>4}  {str(p['team']):>4}  {str(p['player_id']):>12}  "
+            f"{p['name']:<24}  {main}{suffix}"
+        )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Extract War Thunder relay players and REAL vehicles via controlledUnitRef/ECS plus combat evidence."
+    )
+    ap.add_argument(
+        "inputs",
+        nargs="+",
+        help=".wrpl file(s), a directory containing .wrpl parts, or a glob",
+    )
+    ap.add_argument("-o", "--output", help="Output JSON path")
+    ap.add_argument(
+        "--require-real-vehicles",
+        action="store_true",
+        help="Exit with code 3 if one or more identified players have no real vehicle evidence.",
+    )
+    args = ap.parse_args()
+
+    files = collect_input_files(args.inputs)
+    prepared: list[tuple[ReplayHeader, Path, bytes]] = []
+    for p in files:
+        data = p.read_bytes()
+        header = parse_header(p, data)
+        prepared.append((header, p, data))
+
+    # Parse parts in replay order; verify session consistency when possible.
+    prepared.sort(key=lambda x: (x[0].session_id, x[0].replay_part_number, x[1].name))
+    session_ids = {x[0].session_id for x in prepared}
+    if len(session_ids) > 1:
+        raise ParseError(
+            "Input contains multiple replay sessions: "
+            + ", ".join(f"{x:016x}" for x in sorted(session_ids))
+        )
+
+    collector = Collector()
+    headers: list[ReplayHeader] = []
+    for header, path, data in prepared:
+        stream, _consumed = decompress_wrpl_stream(data, header)
+        collector.process_packets(iter_packets(stream), header.replay_part_number)
+        headers.append(header)
+
+    result = build_result(headers, collector)
+    print_summary(result)
+
+    if args.output:
+        out = Path(args.output)
+    elif len(files) == 1:
+        out = files[0].with_name(files[0].stem + "_players_vehicles.json")
+    else:
+        out = Path("players_vehicles.json")
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nJSON written: {out}")
+
+    missing = [p for p in result["players"] if p.get("player_id") is not None and not p.get("main_vehicles")]
+    if missing:
+        print(f"WARNING: {len(missing)} player(s) have no real vehicle in the supplied replay part(s).")
+        print("Supply the later .wrpl parts from the SAME session; part 0 often ends before first spawn.")
+        if args.require_real_vehicles:
+            return 3
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ParseError, OSError, EOFError) as e:
+        print(f"ERROR: {e}")
+        raise SystemExit(2)

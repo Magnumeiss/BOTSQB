@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""Convert a War Thunder .wrpl replay into a readable JSON representation.
+
+The converter understands the WRPL container/header, the embedded FAT BLK
+settings block, the zlib-compressed packet stream and the replay packet framing.
+Protocol-specific packet payloads are preserved losslessly as hex and exposed
+with printable-string previews.
+
+No third-party packages are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import math
+import re
+import struct
+import sys
+import zlib
+from pathlib import Path
+from typing import Any
+
+WRPL_MAGIC = bytes.fromhex("e5 ac 00 10")
+WRPL_HEADER_REGION_SIZE = 1234
+
+PACKET_TYPE_NAMES = {
+    0: "EndMarker",
+    1: "StartMarker",
+    2: "AircraftSmall",
+    3: "Chat",
+    4: "MPI",
+    5: "NextSegment",
+    6: "ECS",
+    7: "Snapshot",
+    8: "ReplayHeaderInfo",
+}
+
+
+class WrplError(RuntimeError):
+    pass
+
+
+def _fixed_c_string(raw: bytes) -> str:
+    raw = raw.split(b"\x00", 1)[0]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _iso_utc(unix_seconds: int) -> str | None:
+    if unix_seconds <= 0:
+        return None
+    try:
+        return _dt.datetime.fromtimestamp(unix_seconds, tz=_dt.timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+class Cursor:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    def take(self, n: int) -> bytes:
+        if n < 0 or self.pos + n > len(self.data):
+            raise WrplError(f"Unexpected end of data at offset {self.pos}, need {n} bytes")
+        out = self.data[self.pos:self.pos + n]
+        self.pos += n
+        return out
+
+    def unpack(self, fmt: str) -> tuple[Any, ...]:
+        size = struct.calcsize(fmt)
+        return struct.unpack(fmt, self.take(size))
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def i32(self) -> int:
+        return self.unpack("<i")[0]
+
+    def u32(self) -> int:
+        return self.unpack("<I")[0]
+
+    def i64(self) -> int:
+        return self.unpack("<q")[0]
+
+    def u64(self) -> int:
+        return self.unpack("<Q")[0]
+
+    def f32(self) -> float:
+        return self.unpack("<f")[0]
+
+
+# WRPLHeader as used by current community parsers. The serialized struct itself
+# occupies 1226 bytes; War Thunder reserves/uses a 1234-byte header region before
+# the Settings BLK starts, so the final 8 bytes are retained separately.
+def parse_wrpl_header(file_data: bytes) -> dict[str, Any]:
+    if len(file_data) < WRPL_HEADER_REGION_SIZE:
+        raise WrplError(
+            f"File is too small for a WRPL header: {len(file_data)} bytes"
+        )
+
+    c = Cursor(file_data[:WRPL_HEADER_REGION_SIZE])
+    magic = c.take(4)
+    if magic != WRPL_MAGIC:
+        raise WrplError(
+            f"Not a supported WRPL file: magic {magic.hex(' ')} != {WRPL_MAGIC.hex(' ')}"
+        )
+
+    h: dict[str, Any] = {
+        "magic_hex": magic.hex(" "),
+        "version": c.i32(),
+        "level": _fixed_c_string(c.take(128)),
+        "level_settings": _fixed_c_string(c.take(260)),
+        "battle_type": _fixed_c_string(c.take(128)),
+        "environment": _fixed_c_string(c.take(128)),
+        "visibility": _fixed_c_string(c.take(32)),
+        "results_blk_offset": c.i32(),
+        "difficulty": c.u8(),
+        "unknown_0_hex": c.take(35).hex(),
+        "session_type": c.u32(),
+        "unknown_1_hex": c.take(4).hex(),
+        "session_id": c.u64(),
+        "replay_part_number": c.u8(),
+        "unknown_2_hex": c.take(3).hex(),
+        "mset_size": c.u32(),
+        "settings_blk_size": struct.unpack("<H", c.take(2))[0],
+        "unknown_3_hex": c.take(30).hex(),
+        "loc_name": _fixed_c_string(c.take(128)),
+        "start_time_unix": c.u32(),
+        "time_limit": c.u32(),
+        "score_limit": c.u32(),
+        "unknown_4_hex": c.take(48).hex(),
+        "battle_class": _fixed_c_string(c.take(128)),
+        "battle_kill_streak": _fixed_c_string(c.take(128)),
+        "unknown_5_hex": c.take(2).hex(),
+    }
+
+    h["parsed_struct_bytes"] = c.pos
+    h["header_region_bytes"] = WRPL_HEADER_REGION_SIZE
+    h["header_tail_hex"] = c.take(WRPL_HEADER_REGION_SIZE - c.pos).hex()
+    h["start_time_utc"] = _iso_utc(h["start_time_unix"])
+    h["is_server_replay_hint"] = len(bytes.fromhex(h["unknown_2_hex"])) >= 2 and bytes.fromhex(h["unknown_2_hex"])[1] == 0x5A
+    return h
+
+
+def read_uleb128(data: bytes, pos: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    start = pos
+    while True:
+        if pos >= len(data):
+            raise WrplError(f"Truncated ULEB128 at BLK offset {start}")
+        b = data[pos]
+        pos += 1
+        value |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise WrplError(f"ULEB128 too large at BLK offset {start}")
+
+
+def _add_repeated(obj: dict[str, Any], key: str, value: Any) -> None:
+    if key not in obj:
+        obj[key] = value
+    elif isinstance(obj[key], list):
+        obj[key].append(value)
+    else:
+        obj[key] = [obj[key], value]
+
+
+def _finite_float(v: float) -> float | str:
+    # JSON does not have standard NaN/Infinity values. Keep them as strings.
+    if math.isfinite(v):
+        return v
+    if math.isnan(v):
+        return "NaN"
+    return "Infinity" if v > 0 else "-Infinity"
+
+
+def _parse_blk_value(type_id: int, param_data: bytes, value_offset: int, names: list[str]) -> Any:
+    def require(n: int) -> bytes:
+        if value_offset < 0 or value_offset + n > len(param_data):
+            raise WrplError(
+                f"BLK parameter value out of range: offset={value_offset}, size={n}, data={len(param_data)}"
+            )
+        return param_data[value_offset:value_offset + n]
+
+    if type_id == 0x01:  # string: offset into names/string table
+        raw = require(4)
+        off = struct.unpack("<I", raw)[0]
+        if off >= len(param_data):
+            # Some FAT variants place strings in the names blob rather than param_data.
+            # Caller will normally have param_data including the string section; if not,
+            # preserve the offset instead of crashing.
+            return {"string_offset": off}
+        end = param_data.find(b"\x00", off)
+        if end < 0:
+            end = len(param_data)
+        return param_data[off:end].decode("utf-8", errors="replace")
+    if type_id == 0x02:
+        return struct.unpack("<i", require(4))[0]
+    if type_id == 0x03:
+        return _finite_float(struct.unpack("<f", require(4))[0])
+    if type_id == 0x04:
+        return [_finite_float(v) for v in struct.unpack("<2f", require(8))]
+    if type_id == 0x05:
+        return [_finite_float(v) for v in struct.unpack("<3f", require(12))]
+    if type_id == 0x06:
+        return [_finite_float(v) for v in struct.unpack("<4f", require(16))]
+    if type_id == 0x07:
+        return list(struct.unpack("<2i", require(8)))
+    if type_id == 0x08:
+        return list(struct.unpack("<3i", require(12)))
+    if type_id == 0x09:
+        return require(1)[0] != 0
+    if type_id == 0x0A:
+        return list(require(4))
+    if type_id == 0x0B:
+        vals = struct.unpack("<12f", require(48))
+        return [_finite_float(v) for v in vals]
+    if type_id == 0x0C:
+        return struct.unpack("<q", require(8))[0]
+    if type_id == 0x0D:
+        return list(struct.unpack("<4i", require(16)))
+    return {"unknown_type": type_id, "value_offset": value_offset}
+
+
+def parse_fat_blk(data: bytes) -> dict[str, Any]:
+    """Parse War Thunder FAT BLK (storage type 0x01), with strict bounds checks."""
+    if not data:
+        raise WrplError("Settings BLK is empty")
+    if data[0] != 0x01:
+        raise WrplError(f"Unsupported BLK storage type 0x{data[0]:02x}; expected FAT 0x01")
+
+    pos = 1
+    names_count, pos = read_uleb128(data, pos)
+    names_size, pos = read_uleb128(data, pos)
+    if pos + names_size > len(data):
+        raise WrplError("BLK names table exceeds block size")
+    names_blob = data[pos:pos + names_size]
+    pos += names_size
+    names = [x.decode("utf-8", errors="replace") for x in names_blob.split(b"\x00")[:-1]]
+
+    blocks_count, pos = read_uleb128(data, pos)
+    params_count, pos = read_uleb128(data, pos)
+    params_data_size, pos = read_uleb128(data, pos)
+
+    if pos + params_data_size > len(data):
+        raise WrplError("BLK parameter data exceeds block size")
+    params_data = data[pos:pos + params_data_size]
+    pos += params_data_size
+
+    info_size = params_count * 8
+    if pos + info_size > len(data):
+        raise WrplError("BLK parameter descriptor table is truncated")
+    params_info = data[pos:pos + info_size]
+    pos += info_size
+
+    # Block descriptors occupy the remainder. Each has name_id, field_count,
+    # child_count and, only if child_count > 0, first_child_id as ULEB128 values.
+    block_desc: list[tuple[int, int, int, int]] = []
+    block_pos = pos
+    for i in range(blocks_count):
+        name_id, block_pos = read_uleb128(data, block_pos)
+        field_count, block_pos = read_uleb128(data, block_pos)
+        child_count, block_pos = read_uleb128(data, block_pos)
+        first_child = 0
+        if child_count:
+            first_child, block_pos = read_uleb128(data, block_pos)
+        block_desc.append((name_id, field_count, child_count, first_child))
+
+    def param_at(index: int) -> tuple[str, Any]:
+        off = index * 8
+        if off + 8 > len(params_info):
+            raise WrplError(f"BLK parameter {index} descriptor is out of bounds")
+        chunk = params_info[off:off + 8]
+        name_id = chunk[0] | (chunk[1] << 8) | (chunk[2] << 16)
+        type_id = chunk[3]
+        inline = chunk[4:8]
+        raw_u32 = struct.unpack("<I", inline)[0]
+
+        if name_id >= len(names):
+            raise WrplError(f"BLK parameter {index} name id {name_id} out of range")
+        key = names[name_id]
+
+        def read_at(offset: int, n: int) -> bytes:
+            if offset < 0 or offset + n > len(params_data):
+                raise WrplError(
+                    f"BLK parameter {index} data offset {offset}+{n} exceeds {len(params_data)}"
+                )
+            return params_data[offset:offset + n]
+
+        if type_id == 0x01:  # STRING
+            in_name_map = bool(raw_u32 >> 31)
+            string_off = raw_u32 & 0x7FFFFFFF
+            if in_name_map:
+                if string_off >= len(names):
+                    raise WrplError(
+                        f"BLK parameter {index} string name-map id {string_off} out of range"
+                    )
+                value: Any = names[string_off]
+            else:
+                if string_off >= len(params_data):
+                    raise WrplError(
+                        f"BLK parameter {index} string offset {string_off} out of range"
+                    )
+                end = params_data.find(b"\x00", string_off)
+                if end < 0:
+                    raise WrplError(f"BLK parameter {index} has unterminated string")
+                value = params_data[string_off:end].decode("utf-8", errors="replace")
+        elif type_id == 0x02:  # INT32, inline
+            value = struct.unpack("<i", inline)[0]
+        elif type_id == 0x03:  # FLOAT32, inline
+            value = _finite_float(struct.unpack("<f", inline)[0])
+        elif type_id == 0x04:  # FLOAT2, data offset
+            value = [_finite_float(v) for v in struct.unpack("<2f", read_at(raw_u32, 8))]
+        elif type_id == 0x05:  # FLOAT3
+            value = [_finite_float(v) for v in struct.unpack("<3f", read_at(raw_u32, 12))]
+        elif type_id == 0x06:  # FLOAT4
+            value = [_finite_float(v) for v in struct.unpack("<4f", read_at(raw_u32, 16))]
+        elif type_id == 0x07:  # INT2
+            value = list(struct.unpack("<2i", read_at(raw_u32, 8)))
+        elif type_id == 0x08:  # INT3
+            value = list(struct.unpack("<3i", read_at(raw_u32, 12)))
+        elif type_id == 0x09:  # BOOL, inline uint32
+            value = raw_u32 != 0
+        elif type_id == 0x0A:  # COLOR, inline RGBA bytes
+            value = list(inline)
+        elif type_id == 0x0B:  # FLOAT12 / 4x3 matrix
+            vals = struct.unpack("<12f", read_at(raw_u32, 48))
+            value = [
+                [_finite_float(vals[r * 3 + c]) for c in range(3)]
+                for r in range(4)
+            ]
+        elif type_id == 0x0C:  # INT64 at data offset
+            value = struct.unpack("<q", read_at(raw_u32, 8))[0]
+        elif type_id == 0x0D:  # INT4
+            value = list(struct.unpack("<4i", read_at(raw_u32, 16)))
+        else:
+            raise WrplError(f"BLK parameter {index} has unknown type 0x{type_id:02x}")
+        return key, value
+
+    # Parameters are assigned to blocks sequentially according to field_count.
+    flat: list[dict[str, Any]] = []
+    param_ptr = 0
+    for i, (name_id, field_count, child_count, first_child) in enumerate(block_desc):
+        if name_id == 0:
+            block_name = "root"
+        else:
+            nidx = name_id - 1
+            if nidx >= len(names):
+                raise WrplError(f"BLK block {i} name id {name_id} out of range")
+            block_name = names[nidx]
+
+        fields: list[tuple[str, Any]] = []
+        for j in range(field_count):
+            fields.append(param_at(param_ptr + j))
+        param_ptr += field_count
+        flat.append({
+            "name": block_name,
+            "fields": fields,
+            "child_count": child_count,
+            "first_child": first_child,
+        })
+
+    if param_ptr != params_count:
+        raise WrplError(
+            f"BLK parameter accounting mismatch: blocks reference {param_ptr}, table has {params_count}"
+        )
+    if not flat:
+        return {"data": {}, "_blk_metadata": {"storage_type": "FAT"}}
+
+    active: set[int] = set()
+    def build(idx: int) -> dict[str, Any]:
+        if idx < 0 or idx >= len(flat):
+            raise WrplError(f"BLK child block index {idx} out of range")
+        if idx in active:
+            raise WrplError(f"BLK child cycle detected at block {idx}")
+        active.add(idx)
+        fb = flat[idx]
+        out: dict[str, Any] = {}
+        for key, value in fb["fields"]:
+            _add_repeated(out, key, value)
+        first = int(fb["first_child"])
+        count = int(fb["child_count"])
+        for child_idx in range(first, first + count):
+            child_obj = build(child_idx)
+            _add_repeated(out, str(flat[child_idx]["name"]), child_obj)
+        active.remove(idx)
+        return out
+
+    root = build(0)
+    return {
+        "data": root,
+        "_blk_metadata": {
+            "storage_type": "FAT",
+            "names_count_declared": names_count,
+            "names_count_parsed": len(names),
+            "blocks_count": blocks_count,
+            "params_count": params_count,
+            "params_data_size": params_data_size,
+            "descriptor_bytes_consumed": block_pos - pos,
+            "trailing_bytes_hex": data[block_pos:].hex(),
+        },
+    }
+
+
+def read_packet_size(data: bytes, pos: int) -> tuple[int, int, str]:
+    if pos >= len(data):
+        raise EOFError
+    start = pos
+    first = data[pos]
+    pos += 1
+
+    if first & 0x80:
+        if first & 0x40:
+            raise WrplError(f"Invalid packet-size prefix 0x{first:02x} at decompressed offset {start}")
+        return first & 0x7F, pos, data[start:pos].hex()
+
+    if first & 0x40:
+        if pos + 1 > len(data):
+            raise WrplError("Truncated 2-byte packet-size prefix")
+        val = ((first << 8) | data[pos]) ^ 0x4000
+        pos += 1
+        return val, pos, data[start:pos].hex()
+
+    if first & 0x20:
+        if pos + 2 > len(data):
+            raise WrplError("Truncated 3-byte packet-size prefix")
+        val = ((first << 16) | (data[pos] << 8) | data[pos + 1]) ^ 0x200000
+        pos += 2
+        return val, pos, data[start:pos].hex()
+
+    if first & 0x10:
+        if pos + 3 > len(data):
+            raise WrplError("Truncated 4-byte packet-size prefix")
+        val = (
+            (first << 24)
+            | (data[pos] << 16)
+            | (data[pos + 1] << 8)
+            | data[pos + 2]
+        ) ^ 0x10000000
+        pos += 3
+        return val, pos, data[start:pos].hex()
+
+    if pos + 4 > len(data):
+        raise WrplError("Truncated 5-byte packet-size prefix")
+    val = struct.unpack_from("<I", data, pos)[0]
+    pos += 4
+    return val, pos, data[start:pos].hex()
+
+
+_PRINTABLE_RE = re.compile(rb"[\x20-\x7e]{4,}")
+_UTF8ISH_RE = re.compile(rb"[\x20-\x7e\x09\x0a\x0d\xc2-\xf4]{4,}")
+
+
+def extract_strings(payload: bytes, limit: int = 50) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _PRINTABLE_RE.finditer(payload):
+        s = match.group().decode("ascii", errors="ignore").strip()
+        if s and s not in seen:
+            seen.add(s)
+            found.append(s)
+            if len(found) >= limit:
+                break
+    return found
+
+
+def parse_packets(stream: bytes) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    packets: list[dict[str, Any]] = []
+    pos = 0
+    current_time = 0
+    zero_size_prefixes = 0
+    type_counts: dict[str, int] = {}
+
+    while pos < len(stream):
+        packet_offset = pos
+        packet_size, after_size, size_prefix_hex = read_packet_size(stream, pos)
+        pos = after_size
+
+        if packet_size == 0:
+            zero_size_prefixes += 1
+            continue
+        if packet_size < 2:
+            raise WrplError(
+                f"Invalid packet size {packet_size} at decompressed offset {packet_offset}"
+            )
+        if pos + packet_size > len(stream):
+            raise WrplError(
+                f"Packet at decompressed offset {packet_offset} declares {packet_size} bytes, "
+                f"but only {len(stream) - pos} remain"
+            )
+
+        header0 = stream[pos]
+        header1 = stream[pos + 1]
+        pos += 2
+
+        reused_timestamp = bool(header0 & 0x10)
+        if reused_timestamp:
+            type_id = header0 ^ 0x10
+            payload_size = packet_size - 2
+        else:
+            type_id = header0
+            if packet_size < 6:
+                raise WrplError(
+                    f"Packet at {packet_offset} is too short for a timestamp ({packet_size} bytes)"
+                )
+            current_time = struct.unpack_from("<I", stream, pos)[0]
+            pos += 4
+            payload_size = packet_size - 6
+
+        payload = stream[pos:pos + payload_size]
+        pos += payload_size
+        type_name = PACKET_TYPE_NAMES.get(type_id, f"Unknown_{type_id}")
+        type_counts[type_name] = type_counts.get(type_name, 0) + 1
+
+        packet: dict[str, Any] = {
+            "index": len(packets),
+            "decompressed_offset": packet_offset,
+            "size_prefix_hex": size_prefix_hex,
+            "declared_packet_size": packet_size,
+            "type_id": type_id,
+            "type_name": type_name,
+            "header_byte_2": header1,
+            "timestamp_ms": current_time,
+            "timestamp_seconds": current_time / 1000.0,
+            "timestamp_reused": reused_timestamp,
+            "payload_size": payload_size,
+            "payload_hex": payload.hex(),
+        }
+        strings = extract_strings(payload)
+        if strings:
+            packet["printable_strings"] = strings
+        packets.append(packet)
+
+    summary = {
+        "packet_count": len(packets),
+        "zero_size_prefixes_skipped": zero_size_prefixes,
+        "parsed_decompressed_bytes": pos,
+        "decompressed_bytes": len(stream),
+        "ended_exactly_at_eof": pos == len(stream),
+        "packet_type_counts": dict(sorted(type_counts.items())),
+    }
+    return packets, summary
+
+
+def decompress_zlib_exact(blob: bytes) -> tuple[bytes, dict[str, Any]]:
+    if not blob:
+        raise WrplError("Compressed packet stream is empty")
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(blob)
+        out += d.flush()
+    except zlib.error as exc:
+        raise WrplError(f"zlib decompression failed: {exc}") from exc
+
+    if not d.eof:
+        raise WrplError("zlib stream is truncated: end-of-stream marker was not reached")
+    return out, {
+        "compressed_bytes_supplied": len(blob),
+        "decompressed_bytes": len(out),
+        "unused_data_bytes": len(d.unused_data),
+        "unconsumed_tail_bytes": len(d.unconsumed_tail),
+        "zlib_eof": d.eof,
+    }
+
+
+def convert_wrpl(input_path: Path) -> dict[str, Any]:
+    data = input_path.read_bytes()
+    header = parse_wrpl_header(data)
+
+    settings_size = int(header["settings_blk_size"])
+    settings_start = WRPL_HEADER_REGION_SIZE
+    settings_end = settings_start + settings_size
+    if settings_end > len(data):
+        raise WrplError(
+            f"Settings BLK ends at {settings_end}, beyond file size {len(data)}"
+        )
+
+    settings_raw = data[settings_start:settings_end]
+    settings_record: dict[str, Any] = {
+        "offset": settings_start,
+        "size": settings_size,
+        "sha256": hashlib.sha256(settings_raw).hexdigest(),
+        "raw_hex": settings_raw.hex(),
+    }
+    try:
+        blk = parse_fat_blk(settings_raw)
+        settings_record["parsed"] = blk["data"]
+        settings_record["blk_metadata"] = blk["_blk_metadata"]
+        settings_record["parse_status"] = "ok"
+    except WrplError as exc:
+        # Preserve exact bytes and keep conversion useful even for another BLK variant.
+        settings_record["parse_status"] = "raw_only"
+        settings_record["parse_error"] = str(exc)
+
+    packet_start = settings_end
+    result_offset = int(header["results_blk_offset"])
+    if result_offset:
+        if not (packet_start <= result_offset <= len(data)):
+            raise WrplError(
+                f"Invalid results_blk_offset={result_offset}; expected between {packet_start} and {len(data)}"
+            )
+        packet_blob = data[packet_start:result_offset]
+        results_raw = data[result_offset:]
+    else:
+        packet_blob = data[packet_start:]
+        results_raw = b""
+
+    decompressed, zmeta = decompress_zlib_exact(packet_blob)
+
+    # A nonzero ResultsBlkOffset normally cleanly separates the regions. If no result
+    # offset exists, unused zlib bytes can still reveal a trailing region; retain them.
+    if zmeta["unused_data_bytes"] and not results_raw:
+        # decompressobj.unused_data is a suffix of the supplied packet blob.
+        unused = zlib.decompressobj()  # dummy to keep branch explicit; unused itself is below
+        del unused
+        d = zlib.decompressobj()
+        _ = d.decompress(packet_blob)
+        _ = d.flush()
+        results_raw = d.unused_data
+        if results_raw:
+            packet_blob = packet_blob[:-len(results_raw)]
+            decompressed, zmeta = decompress_zlib_exact(packet_blob)
+
+    packets, packet_summary = parse_packets(decompressed)
+
+    results_record: dict[str, Any] | None = None
+    if results_raw:
+        results_record = {
+            "offset": result_offset if result_offset else len(data) - len(results_raw),
+            "size": len(results_raw),
+            "sha256": hashlib.sha256(results_raw).hexdigest(),
+            "raw_hex": results_raw.hex(),
+        }
+        try:
+            blk = parse_fat_blk(results_raw)
+            results_record["parsed"] = blk["data"]
+            results_record["blk_metadata"] = blk["_blk_metadata"]
+            results_record["parse_status"] = "ok"
+        except WrplError as exc:
+            results_record["parse_status"] = "raw_only"
+            results_record["parse_error"] = str(exc)
+
+    return {
+        "format": "War Thunder WRPL readable export",
+        "converter": {
+            "schema_version": 1,
+            "notes": [
+                "Header and replay settings are decoded where the WRPL/FAT-BLK structure is known.",
+                "The zlib packet stream is fully decompressed and packet framing is decoded.",
+                "Game-protocol packet payloads are kept losslessly in payload_hex; printable strings are surfaced separately.",
+            ],
+        },
+        "source": {
+            "file_name": input_path.name,
+            "file_size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        },
+        "layout": {
+            "header_offset": 0,
+            "header_region_size": WRPL_HEADER_REGION_SIZE,
+            "settings_offset": settings_start,
+            "settings_size": settings_size,
+            "compressed_packet_stream_offset": packet_start,
+            "compressed_packet_stream_size": len(packet_blob),
+            "results_offset": result_offset or None,
+        },
+        "header": header,
+        "settings_blk": settings_record,
+        "packet_stream": {
+            "compression": "zlib",
+            "compressed_sha256": hashlib.sha256(packet_blob).hexdigest(),
+            "decompressed_sha256": hashlib.sha256(decompressed).hexdigest(),
+            "decompression": zmeta,
+            "summary": packet_summary,
+            "packets": packets,
+        },
+        "results_blk": results_record,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Convert a War Thunder .wrpl replay into readable JSON."
+    )
+    parser.add_argument("input", type=Path, help="Input .wrpl file")
+    parser.add_argument("-o", "--output", type=Path, help="Output .json file")
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Write compact JSON instead of indented Notepad-friendly JSON",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.input.is_file():
+        print(f"ERROR: input file not found: {args.input}", file=sys.stderr)
+        return 2
+    output = args.output or args.input.with_suffix(".json")
+
+    try:
+        result = convert_wrpl(args.input)
+        output.write_text(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                indent=None if args.compact else 2,
+                separators=(",", ":") if args.compact else None,
+                allow_nan=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+    except (OSError, WrplError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"OK: {args.input} -> {output}")
+    print(f"Packets: {result['packet_stream']['summary']['packet_count']}")
+    print(f"Decompressed: {result['packet_stream']['decompression']['decompressed_bytes']} bytes")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
